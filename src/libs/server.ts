@@ -17,7 +17,7 @@ import {
 import cookieParser from 'cookie-parser';
 import { EventEmitter } from 'events';
 import express, { Application, NextFunction, Request, Response } from 'express';
-import { readFile } from 'fs';
+import { promises as fsPromises, readFile } from 'fs';
 import { createServer as httpCreateServer, Server as httpServer } from 'http';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import {
@@ -26,15 +26,16 @@ import {
 } from 'https';
 import killable from 'killable';
 import { lookup as mimeTypeLookup } from 'mime-types';
-import { basename, isAbsolute, resolve } from 'path';
+import { basename } from 'path';
 import { parse as qsParse } from 'qs';
+import { SecureContextOptions } from 'tls';
 import TypedEmitter from 'typed-emitter';
 import { xml2js } from 'xml-js';
-import { DefaultSSLConfig } from '../constants/ssl.constants';
+import { DefaultTLSOptions } from '../constants/ssl.constants';
 import { Texts } from '../i18n/en';
 import { ResponseRulesInterpreter } from './response-rules-interpreter';
 import { TemplateParser } from './template-parser';
-import { CreateTransaction } from './utils';
+import { CreateTransaction, resolvePathFromEnvironment } from './utils';
 
 /**
  * Create a server instance from an Environment object.
@@ -43,6 +44,7 @@ import { CreateTransaction } from './utils';
  */
 export class MockoonServer extends (EventEmitter as new () => TypedEmitter<ServerEvents>) {
   private serverInstance: httpServer | httpsServer;
+  private tlsOptions: SecureContextOptions = {};
 
   constructor(
     private environment: Environment,
@@ -54,14 +56,55 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
   /**
    * Start a server
    */
-  public start() {
+  public async start() {
     const server = express();
     server.disable('x-powered-by');
     server.disable('etag');
 
     // create https or http server instance
-    if (this.environment.https) {
-      this.serverInstance = httpsCreateServer(DefaultSSLConfig, server);
+    if (this.environment.tlsOptions.enabled) {
+      if (this.environment.tlsOptions?.pfxPath) {
+        this.tlsOptions.pfx = await fsPromises.readFile(
+          resolvePathFromEnvironment(
+            this.environment.tlsOptions?.pfxPath,
+            this.options.environmentDirectory
+          )
+        );
+      } else if (
+        this.environment.tlsOptions?.certPath &&
+        this.environment.tlsOptions?.keyPath
+      ) {
+        this.tlsOptions.cert = await fsPromises.readFile(
+          resolvePathFromEnvironment(
+            this.environment.tlsOptions?.certPath,
+            this.options.environmentDirectory
+          )
+        );
+        this.tlsOptions.key = await fsPromises.readFile(
+          resolvePathFromEnvironment(
+            this.environment.tlsOptions?.keyPath,
+            this.options.environmentDirectory
+          )
+        );
+      } else {
+        this.tlsOptions = { ...DefaultTLSOptions };
+      }
+
+      // move two ifs to pfx/cert only
+      if (this.environment.tlsOptions?.caPath) {
+        this.tlsOptions.ca = await fsPromises.readFile(
+          resolvePathFromEnvironment(
+            this.environment.tlsOptions?.caPath,
+            this.options.environmentDirectory
+          )
+        );
+      }
+
+      if (this.environment.tlsOptions?.passphrase) {
+        this.tlsOptions.passphrase = this.environment.tlsOptions?.passphrase;
+      }
+
+      this.serverInstance = httpsCreateServer(this.tlsOptions, server);
     } else {
       this.serverInstance = httpCreateServer(server);
     }
@@ -429,10 +472,10 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
         this.environment
       );
 
-      // if possible, resolve the file paths relatively from the current environment's directory
-      if (this.options.environmentDirectory && !isAbsolute(filePath)) {
-        filePath = resolve(this.options.environmentDirectory, filePath);
-      }
+      filePath = resolvePathFromEnvironment(
+        filePath,
+        this.options.environmentDirectory
+      );
 
       readFile(filePath, (readError, data) => {
         try {
@@ -539,7 +582,7 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
           secure: false,
           changeOrigin: true,
           logProvider: this.options.logProvider,
-          ssl: { ...DefaultSSLConfig, agent: false },
+          ssl: { ...this.tlsOptions, agent: false },
           onProxyReq: (proxyReq, request, response) => {
             this.refreshEnvironment();
 
